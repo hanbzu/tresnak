@@ -3,5 +3,5 @@
 Nola erabili:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hanbzu/tresnak/main/scripts/codelines-candlestick.ts | sh
+deno run --allow-run --allow-env https://raw.githubusercontent.com/hanbzu/tresnak/main/scripts/codecandles.ts
 ```
