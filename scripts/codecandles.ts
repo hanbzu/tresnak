@@ -8,12 +8,18 @@
  *
  * The chart also tracks codebase growth over time. Growth has a cost — more code means more to
  * read, maintain, and understand — so the goal is deliberate expansion, not mindless accumulation.
+ *
+ * Parameters:
+ * - `--months N` / `-m N` controls how far back the chart goes. Default: 6 months.
+ * - `--lines-per-block N` / `-b N` controls the vertical scale. Default: 500 LOC per row.
+ * - Y axis labels and guide lines are emitted every 4 blocks automatically.
+ * - The historical positional `[weeks]` argument is still accepted for backwards compatibility.
  */
 
-const LOC_PER_ROW = 500; // vertical resolution: one character row equals this many lines
-const LABEL_INTERVAL = 2000; // Y axis labels appear at every multiple of this value
+const DEFAULT_LINES_PER_BLOCK = 500; // vertical resolution: one character row equals this many lines
+const Y_AXIS_INTERVAL_MULTIPLIER = 4; // Y axis labels appear every 4 block heights
 const WEEKS_PER_MONTH = 4.33; // approximation used to convert a week count to months for display
-const DEFAULT_WEEKS = 26;
+const DEFAULT_MONTHS = 6;
 const MONTHS = [
     "Jan",
     "Feb",
@@ -35,12 +41,91 @@ const RED = "\x1b[31m";
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 
-const weeks = parseInt(Deno.args[0] ?? String(DEFAULT_WEEKS));
 const useColor =
     !Deno.env.get("NO_COLOR") &&
     (Deno.stdout.isTerminal() ||
         !!Deno.env.get("FORCE_COLOR") ||
         Deno.env.get("CI") === "true");
+
+interface CliOptions {
+    months: number;
+    linesPerBlock: number;
+}
+
+/** Parses CLI flags while preserving the historical positional week-count argument. */
+function parseArgs(args: string[]): CliOptions {
+    let months = DEFAULT_MONTHS;
+    let weeksOverride: number | null = null;
+    let linesPerBlock = DEFAULT_LINES_PER_BLOCK;
+    let positionalWeeksConsumed = false;
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+
+        if (!arg.startsWith("-") && !positionalWeeksConsumed) {
+            weeksOverride = parsePositiveInt(arg, "weeks");
+            positionalWeeksConsumed = true;
+            continue;
+        }
+
+        if (arg === "--months" || arg === "-m") {
+            months = parsePositiveInt(args[++i], "months");
+            continue;
+        }
+
+        if (arg.startsWith("--months=")) {
+            months = parsePositiveInt(arg.slice("--months=".length), "months");
+            continue;
+        }
+
+        if (arg === "--lines-per-block" || arg === "-b") {
+            linesPerBlock = parsePositiveInt(args[++i], "lines-per-block");
+            continue;
+        }
+
+        if (arg.startsWith("--lines-per-block=")) {
+            linesPerBlock = parsePositiveInt(
+                arg.slice("--lines-per-block=".length),
+                "lines-per-block",
+            );
+            continue;
+        }
+
+        if (arg === "--help" || arg === "-h") {
+            console.log(
+                [
+                    "Usage: codecandles.ts [weeks] [--months N] [--lines-per-block N]",
+                    "",
+                    `Defaults: --months ${DEFAULT_MONTHS}, --lines-per-block ${DEFAULT_LINES_PER_BLOCK}`,
+                    "The optional positional [weeks] argument is kept for backwards compatibility.",
+                ].join("\n"),
+            );
+            Deno.exit(0);
+        }
+
+        console.error(`Unknown argument: ${arg}`);
+        Deno.exit(1);
+    }
+
+    if (weeksOverride !== null) {
+        months = Math.max(1, Math.round(weeksOverride / WEEKS_PER_MONTH));
+    }
+
+    return { months, linesPerBlock };
+}
+
+function parsePositiveInt(value: string | undefined, name: string): number {
+    const parsed = Number.parseInt(value ?? "", 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        console.error(`${name} must be a positive integer.`);
+        Deno.exit(1);
+    }
+    return parsed;
+}
+
+const options = parseArgs(Deno.args);
+const weeks = Math.max(1, Math.round(options.months * WEEKS_PER_MONTH));
+const labelInterval = options.linesPerBlock * Y_AXIS_INTERVAL_MULTIPLIER;
 
 /** Wraps text in an ANSI escape code when color output is enabled. */
 function styled(text: string, code: string): string {
@@ -149,9 +234,16 @@ function buildCandles(data: Week[], initialLoc = 0): Candle[] {
     });
 }
 
-/** Builds the month-label row for the X axis, placing 3-char names at month-start weeks. */
-function buildMonthLabels(candles: Candle[]): string {
-    const cells = new Array<string>(candles.length).fill(" ");
+interface XAxisLabels {
+    months: string;
+    years: string;
+}
+
+/** Builds the X axis labels, placing month names at month-start weeks and years under January. */
+function buildXAxisLabels(candles: Candle[]): XAxisLabels {
+    const monthCells = new Array<string>(candles.length).fill(" ");
+    const yearCells = new Array<string>(candles.length).fill(" ");
+
     for (let i = 0; i < candles.length; i++) {
         const monday = new Date(candles[i].date + "T00:00:00Z");
         // Scan all 7 days of the week to find if the 1st of a month falls within it
@@ -159,31 +251,57 @@ function buildMonthLabels(candles: Candle[]): string {
             const day = new Date(monday);
             day.setUTCDate(monday.getUTCDate() + d);
             if (day.getUTCDate() === 1) {
-                const label = MONTHS[day.getUTCMonth()];
-                for (let j = 0; j < label.length && i + j < cells.length; j++)
-                    cells[i + j] = label[j];
+                const monthLabel = MONTHS[day.getUTCMonth()];
+                for (
+                    let j = 0;
+                    j < monthLabel.length && i + j < monthCells.length;
+                    j++
+                ) {
+                    monthCells[i + j] = monthLabel[j];
+                }
+
+                if (monthLabel === "Jan") {
+                    const yearLabel = String(day.getUTCFullYear());
+                    for (
+                        let j = 0;
+                        j < yearLabel.length && i + j < yearCells.length;
+                        j++
+                    ) {
+                        yearCells[i + j] = yearLabel[j];
+                    }
+                }
                 break;
             }
         }
     }
-    return cells.join("");
+
+    return {
+        months: monthCells.join(""),
+        years: yearCells.join(""),
+    };
 }
 
 /** Renders the full candlestick chart to stdout. */
-function render(candles: Candle[], totalAdds: number, totalDels: number): void {
+function render(
+    candles: Candle[],
+    totalAdds: number,
+    totalDels: number,
+    months: number,
+    linesPerBlock: number,
+    yAxisInterval: number,
+): void {
     if (candles.length === 0) {
         console.log("No git history found.");
         return;
     }
 
-    const months = Math.round(weeks / WEEKS_PER_MONTH);
     const high =
-        Math.ceil(Math.max(...candles.map((c) => c.high)) / LABEL_INTERVAL) *
-        LABEL_INTERVAL;
+        Math.ceil(Math.max(...candles.map((c) => c.high)) / yAxisInterval) *
+        yAxisInterval;
     const low =
-        Math.floor(Math.min(...candles.map((c) => c.low)) / LABEL_INTERVAL) *
-        LABEL_INTERVAL;
-    const chartHeight = Math.max(1, (high - low) / LOC_PER_ROW);
+        Math.floor(Math.min(...candles.map((c) => c.low)) / yAxisInterval) *
+        yAxisInterval;
+    const chartHeight = Math.max(1, (high - low) / linesPerBlock);
     const labelWidth = Math.max(fmtK(high).length, fmtK(low).length) + 1;
 
     console.log(styled(`Lines of code weekly · last ${months} months`, BOLD));
@@ -191,9 +309,9 @@ function render(candles: Candle[], totalAdds: number, totalDels: number): void {
 
     for (let row = 0; row < chartHeight; row++) {
         // Sample the vertical midpoint of each row to determine which part of the candle is visible
-        const y = high - (row + 0.5) * LOC_PER_ROW;
-        const rowLoc = Math.round(high - row * LOC_PER_ROW);
-        const isLabelRow = rowLoc % LABEL_INTERVAL === 0;
+        const y = high - (row + 0.5) * linesPerBlock;
+        const rowLoc = Math.round(high - row * linesPerBlock);
+        const isLabelRow = rowLoc % yAxisInterval === 0;
         const label = isLabelRow
             ? fmtK(rowLoc).padStart(labelWidth)
             : " ".repeat(labelWidth);
@@ -218,10 +336,11 @@ function render(candles: Candle[], totalAdds: number, totalDels: number): void {
         console.log(line);
     }
 
+    const xAxisLabels = buildXAxisLabels(candles);
+
     console.log();
-    console.log(
-        styled(" ".repeat(labelWidth + 1) + buildMonthLabels(candles), DIM),
-    );
+    console.log(styled(" ".repeat(labelWidth + 1) + xAxisLabels.months, DIM));
+    console.log(styled(" ".repeat(labelWidth + 1) + xAxisLabels.years, DIM));
 
     const currentLoc = candles.at(-1)!.close;
     const months_label = `on the last ${months} mo`;
@@ -246,4 +365,11 @@ const openingLoc = allData
 const windowCandles = buildCandles(windowData, openingLoc);
 const totalAdds = windowData.reduce((s, w) => s + w.adds, 0);
 const totalDels = windowData.reduce((s, w) => s + w.dels, 0);
-render(windowCandles, totalAdds, totalDels);
+render(
+    windowCandles,
+    totalAdds,
+    totalDels,
+    options.months,
+    options.linesPerBlock,
+    labelInterval,
+);
