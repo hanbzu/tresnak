@@ -49,7 +49,9 @@ const useColor =
 
 interface CliOptions {
     months: number;
+    weeks: number;
     linesPerBlock: number;
+    rangeLabel: string;
 }
 
 /** Parses CLI flags while preserving the historical positional week-count argument. */
@@ -107,11 +109,13 @@ function parseArgs(args: string[]): CliOptions {
         Deno.exit(1);
     }
 
-    if (weeksOverride !== null) {
-        months = Math.max(1, Math.round(weeksOverride / WEEKS_PER_MONTH));
-    }
+    const weeks = weeksOverride ??
+        Math.max(1, Math.round(months * WEEKS_PER_MONTH));
+    const rangeLabel = weeksOverride !== null
+        ? `last ${weeks} week${weeks === 1 ? "" : "s"}`
+        : `last ${months} month${months === 1 ? "" : "s"}`;
 
-    return { months, linesPerBlock };
+    return { months, weeks, linesPerBlock, rangeLabel };
 }
 
 function parsePositiveInt(value: string | undefined, name: string): number {
@@ -124,7 +128,6 @@ function parsePositiveInt(value: string | undefined, name: string): number {
 }
 
 const options = parseArgs(Deno.args);
-const weeks = Math.max(1, Math.round(options.months * WEEKS_PER_MONTH));
 const labelInterval = options.linesPerBlock * Y_AXIS_INTERVAL_MULTIPLIER;
 
 /** Wraps text in an ANSI escape code when color output is enabled. */
@@ -144,6 +147,12 @@ function fmtK(n: number): string {
 }
 
 interface Week {
+    date: string; // ISO Monday, e.g. "2024-10-07"
+    adds: number;
+    dels: number;
+}
+
+interface Commit {
     date: string; // ISO Monday, e.g. "2024-10-07"
     adds: number;
     dels: number;
@@ -174,10 +183,16 @@ function mondayNWeeksAgo(n: number): string {
     return d.toISOString().slice(0, 10);
 }
 
-/** Runs git log --numstat and returns additions and deletions aggregated per calendar week. */
-async function fetchWeeklyStats(): Promise<Week[]> {
+/** Returns commit-level additions and deletions in chronological order. */
+async function fetchCommits(): Promise<Commit[]> {
     const { stdout, success } = await new Deno.Command("git", {
-        args: ["log", "--pretty=format:%ad", "--date=short", "--numstat"],
+        args: [
+            "log",
+            "--reverse",
+            "--pretty=format:%ad",
+            "--date=short",
+            "--numstat",
+        ],
         stdout: "piped",
         stderr: "null",
     }).output();
@@ -189,27 +204,52 @@ async function fetchWeeklyStats(): Promise<Week[]> {
         Deno.exit(1);
     }
 
-    const byWeek = new Map<string, { adds: number; dels: number }>();
-    let currentWeek = "";
+    const commits: Commit[] = [];
+    let currentCommit: Commit | null = null;
 
     for (const line of new TextDecoder().decode(stdout).split("\n")) {
         const trimmed = line.trim();
         if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-            currentWeek = isoMonday(trimmed);
-            if (!byWeek.has(currentWeek))
-                byWeek.set(currentWeek, { adds: 0, dels: 0 });
-        } else if (currentWeek) {
+            if (currentCommit) {
+                commits.push(currentCommit);
+            }
+            currentCommit = {
+                date: isoMonday(trimmed),
+                adds: 0,
+                dels: 0,
+            };
+        } else if (currentCommit) {
             const m = trimmed.match(/^(\d+)\t(\d+)\t/);
             if (m) {
-                byWeek.get(currentWeek)!.adds += parseInt(m[1]);
-                byWeek.get(currentWeek)!.dels += parseInt(m[2]);
+                currentCommit.adds += parseInt(m[1]);
+                currentCommit.dels += parseInt(m[2]);
             }
         }
     }
 
-    return [...byWeek.entries()]
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([date, { adds, dels }]) => ({ date, adds, dels }));
+    if (currentCommit) {
+        commits.push(currentCommit);
+    }
+
+    return commits;
+}
+
+/** Aggregates commit-level stats into weekly totals. */
+function aggregateWeeklyStats(commits: Commit[]): Week[] {
+    const byWeek = new Map<string, { adds: number; dels: number }>();
+
+    for (const commit of commits) {
+        const week = byWeek.get(commit.date) ?? { adds: 0, dels: 0 };
+        week.adds += commit.adds;
+        week.dels += commit.dels;
+        byWeek.set(commit.date, week);
+    }
+
+    return [...byWeek.entries()].map(([date, { adds, dels }]) => ({
+        date,
+        adds,
+        dels,
+    }));
 }
 
 /** Returns a dense array covering the last n weeks, with zeros for weeks with no commits. */
@@ -221,16 +261,39 @@ function fillWindow(data: Week[], n: number): Week[] {
     });
 }
 
-/** Converts per-week stats into OHLC candles, treating cumulative LOC as the price axis. */
-function buildCandles(data: Week[], initialLoc = 0): Candle[] {
-    let cum = initialLoc;
-    return data.map(({ date, adds, dels }) => {
-        const open = cum;
-        const high = open + adds;
-        const low = Math.max(0, open - dels); // LOC can't go negative
-        const close = open + adds - dels;
-        cum = close;
-        return { date, open, close, high, low };
+/** Converts commit-level stats into weekly OHLC candles using the actual weekly LOC path. */
+function buildCandles(commits: Commit[], weeksToRender: number): Candle[] {
+    const startWeek = mondayNWeeksAgo(weeksToRender - 1);
+    const startIndex = commits.findIndex((commit) => commit.date >= startWeek);
+    const windowStartIndex = startIndex === -1 ? commits.length : startIndex;
+
+    let loc = 0;
+    for (let i = 0; i < windowStartIndex; i++) {
+        loc += commits[i].adds - commits[i].dels;
+    }
+
+    const commitsByWeek = new Map<string, Commit[]>();
+    for (let i = windowStartIndex; i < commits.length; i++) {
+        const commit = commits[i];
+        const bucket = commitsByWeek.get(commit.date) ?? [];
+        bucket.push(commit);
+        commitsByWeek.set(commit.date, bucket);
+    }
+
+    return Array.from({ length: weeksToRender }, (_, i) => {
+        const date = mondayNWeeksAgo(weeksToRender - 1 - i);
+        const weekCommits = commitsByWeek.get(date) ?? [];
+        const open = loc;
+        let high = open;
+        let low = open;
+
+        for (const commit of weekCommits) {
+            loc += commit.adds - commit.dels;
+            high = Math.max(high, loc);
+            low = Math.min(low, loc);
+        }
+
+        return { date, open, close: loc, high, low };
     });
 }
 
@@ -286,7 +349,7 @@ function render(
     candles: Candle[],
     totalAdds: number,
     totalDels: number,
-    months: number,
+    rangeLabel: string,
     linesPerBlock: number,
     yAxisInterval: number,
 ): void {
@@ -304,7 +367,7 @@ function render(
     const chartHeight = Math.max(1, (high - low) / linesPerBlock);
     const labelWidth = Math.max(fmtK(high).length, fmtK(low).length) + 1;
 
-    console.log(styled(`Lines of code weekly · last ${months} months`, BOLD));
+    console.log(styled(`Lines of code weekly · ${rangeLabel}`, BOLD));
     console.log();
 
     for (let row = 0; row < chartHeight; row++) {
@@ -343,33 +406,26 @@ function render(
     console.log(styled(" ".repeat(labelWidth + 1) + xAxisLabels.years, DIM));
 
     const currentLoc = candles.at(-1)!.close;
-    const months_label = `on the last ${months} mo`;
     console.log();
     console.log(
         `Currently ${styled(fmtK(currentLoc) + " lines", BOLD)} ` +
-            `(${styled("+" + fmtK(totalAdds), GREEN)} ${styled("-" + fmtK(totalDels), RED)} ${months_label})`,
+            `(${styled("+" + fmtK(totalAdds), GREEN)} ${styled("-" + fmtK(totalDels), RED)} over the ${rangeLabel})`,
     );
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-const allData = await fetchWeeklyStats();
-const windowData = fillWindow(allData, weeks);
-
-// Find cumulative LOC just before the window starts so candles are anchored to the right baseline
-const windowStart = windowData[0].date;
-const openingLoc = allData
-    .filter((w) => w.date < windowStart)
-    .reduce((sum, w) => sum + w.adds - w.dels, 0);
-
-const windowCandles = buildCandles(windowData, openingLoc);
+const allCommits = await fetchCommits();
+const allData = aggregateWeeklyStats(allCommits);
+const windowData = fillWindow(allData, options.weeks);
+const windowCandles = buildCandles(allCommits, options.weeks);
 const totalAdds = windowData.reduce((s, w) => s + w.adds, 0);
 const totalDels = windowData.reduce((s, w) => s + w.dels, 0);
 render(
     windowCandles,
     totalAdds,
     totalDels,
-    options.months,
+    options.rangeLabel,
     options.linesPerBlock,
     labelInterval,
 );
