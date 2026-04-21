@@ -119,12 +119,12 @@ function parseArgs(args: string[]): CliOptions {
 }
 
 function parsePositiveInt(value: string | undefined, name: string): number {
-    const parsed = Number.parseInt(value ?? "", 10);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
+    const normalized = value?.trim() ?? "";
+    if (!/^[1-9]\d*$/.test(normalized)) {
         console.error(`${name} must be a positive integer.`);
         Deno.exit(1);
     }
-    return parsed;
+    return Number(normalized);
 }
 
 const options = parseArgs(Deno.args);
@@ -189,7 +189,7 @@ async function fetchCommits(): Promise<Commit[]> {
         args: [
             "log",
             "--reverse",
-            "--pretty=format:%ad",
+            "--pretty=format:%cd",
             "--date=short",
             "--numstat",
         ],
